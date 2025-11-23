@@ -2,151 +2,194 @@ import cv2
 import mediapipe as mp
 import serial
 import time
-import math
+import argparse
+import logging
+from serial.serialutil import SerialException
 
-class HandController:
-    def __init__(self, port='COM3', baudrate=9600):  # Change COM3 to your port
-        # Initialize serial connection
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Hand Gesture Control for Robotic Hand')
+    parser.add_argument('--port', default='COM8', help='Serial port (default: COM8)')
+    parser.add_argument('--camera', type=int, default=1, help='Camera index (default: 1)')
+    parser.add_argument('--baud', type=int, default=9600, help='Baud rate (default: 9600)')
+    parser.add_argument('--demo', action='store_true', help='Run in demo mode without serial connection')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    return parser.parse_args()
+
+
+def initialize_serial(port, baud_rate, demo_mode):
+    """Initialize serial connection with robust error handling"""
+    if demo_mode:
+        logger.info("Running in DEMO mode - no serial connection")
+        return None
+
+    try:
+        arduino = serial.Serial(port, baud_rate, timeout=1)
+        time.sleep(2)  # Wait for Arduino to reset
+        logger.info(f"Connected to Arduino on {port} at {baud_rate} baud")
+        return arduino
+    except SerialException as e:
+        logger.error(f"Failed to connect to {port}: {e}")
+        logger.info("Running in demo mode due to connection failure")
+        return None
+
+
+def send_serial_data(arduino, finger_data, demo_mode):
+    """Send data to Arduino with error handling and retries"""
+    data_str = ''.join(str(f) for f in finger_data)
+    # ONLY CHANGE: Removed \n from this line
+    message = f"${data_str}"  # CHANGED: was f"${data_str}\n"
+
+    if demo_mode:
+        logger.info(f"DEMO MODE - Would send: {message.strip()}")
+        return True
+
+    if arduino and arduino.is_open:
         try:
-            self.arduino = serial.Serial(port=port, baudrate=baudrate, timeout=1)
-            time.sleep(2)  # Wait for Arduino to reset
-            print(f"Connected to Arduino on {port}")
-        except Exception as e:
-            print(f"Arduino connection failed: {e}")
-            self.arduino = None
-        
-        # MediaPipe hands setup
-        self.mp_hands = mp.solutions.hands
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
-        )
-        
-        # Finger state thresholds
-        self.finger_threshold = 0.05
-        
-    def calculate_finger_state(self, landmarks, finger_tip, finger_pip):
-        """Check if finger is extended or bent"""
-        tip_y = landmarks[finger_tip].y
-        pip_y = landmarks[finger_pip].y
-        
-        # Finger is open if tip is above PIP joint (for vertical hand)
-        return tip_y < pip_y - self.finger_threshold
-    
-    def get_hand_gesture(self, landmarks):
-        """Get finger states from hand landmarks"""
-        if not landmarks:
-            return "00000"
-        
-        # Check each finger (thumb, index, middle, ring, pinky)
-        thumb_open = self.calculate_finger_state(landmarks, 4, 2)      # Thumb tip vs thumb IP
-        index_open = self.calculate_finger_state(landmarks, 8, 6)      # Index tip vs PIP
-        middle_open = self.calculate_finger_state(landmarks, 12, 10)   # Middle tip vs PIP
-        ring_open = self.calculate_finger_state(landmarks, 16, 14)     # Ring tip vs PIP
-        pinky_open = self.calculate_finger_state(landmarks, 20, 18)    # Pinky tip vs PIP
-        
-        # Convert to string (1=closed, 0=open - matching Arduino expectation)
-        gesture = ("1" if not thumb_open else "0" +
-                  "1" if not index_open else "0" +
-                  "1" if not middle_open else "0" +
-                  "1" if not ring_open else "0" +
-                  "1" if not pinky_open else "0")
-        
-        return gesture
-    
-    def send_to_arduino(self, command):
-        """Send command to Arduino"""
-        if self.arduino and self.arduino.is_open:
+            arduino.write(message.encode())
+            arduino.flush()  # Ensure data is sent
+            logger.info(f"Sent to Arduino: {data_str}")
+            return True
+        except SerialException as e:
+            logger.warning(f"Serial write failed, retrying: {e}")
+            time.sleep(0.1)  # 100ms delay before retry
             try:
-                self.arduino.write((command + '\n').encode())
+                arduino.write(message.encode())
+                arduino.flush()
+                logger.info(f"Sent to Arduino (retry): {data_str}")
                 return True
-            except Exception as e:
-                print(f"Send error: {e}")
+            except SerialException as e2:
+                logger.error(f"Serial write failed after retry: {e2}")
                 return False
-        return False
-    
-    def process_frame(self, frame):
-        """Process frame and detect hand gesture"""
-        # Flip frame for mirror effect
-        frame = cv2.flip(frame, 1)
-        
-        # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Process with MediaPipe
-        results = self.hands.process(rgb_frame)
-        
-        gesture = "00000"  # Default: all fingers open
-        
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                # Draw hand landmarks
-                self.mp_drawing.draw_landmarks(
-                    frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-                
-                # Get gesture
-                gesture = self.get_hand_gesture(hand_landmarks.landmark)
-                
-                # Send to Arduino
-                if self.send_to_arduino(gesture):
-                    # Display sent command on frame
-                    cv2.putText(frame, f"Sent: {gesture}", (10, 30), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        # Display finger states
-        finger_names = ['Thumb', 'Index', 'Middle', 'Ring', 'Pinky']
-        for i, state in enumerate(gesture):
-            color = (0, 0, 255) if state == '1' else (0, 255, 0)  # Red=closed, Green=open
-            status = "CLOSED" if state == '1' else "OPEN"
-            cv2.putText(frame, f"{finger_names[i]}: {status}", (10, 70 + i*30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        
-        return frame
-    
-    def run(self):
-        """Main loop"""
-        cap = cv2.VideoCapture(0)
-        
-        if not cap.isOpened():
-            print("Cannot open camera")
-            return
-        
-        print("Starting hand tracking...")
-        print("Press 'q' to quit")
-        
+    return False
+
+
+def fingers_up(landmarks):
+    """Determine which fingers are up based on landmark positions"""
+    tips_ids = [4, 8, 12, 16, 20]  # Thumb, Index, Middle, Ring, Pinky
+    fingers = []
+
+    # Thumb (compare x-coordinates for right hand)
+    if landmarks[tips_ids[0]].x < landmarks[tips_ids[0] - 1].x:
+        fingers.append(1)
+    else:
+        fingers.append(0)
+
+    # Other four fingers (compare y-coordinates)
+    for id in range(1, 5):
+        if landmarks[tips_ids[id]].y < landmarks[tips_ids[id] - 2].y:
+            fingers.append(1)
+        else:
+            fingers.append(0)
+
+    return fingers
+
+
+def main():
+    args = parse_arguments()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    logger.info(f"Starting Hand Gesture Control - Camera: {args.camera}, Port: {args.port}, Baud: {args.baud}")
+
+    # Initialize camera
+    cap = cv2.VideoCapture(args.camera)
+    cap.set(3, 640)  # Width
+    cap.set(4, 480)  # Height
+
+    if not cap.isOpened():
+        logger.error(f"Cannot open camera {args.camera}")
+        return
+
+    # Initialize MediaPipe Hands
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.5
+    )
+
+    logger.info("MediaPipe hand detector initialized successfully")
+
+    # Initialize serial connection
+    arduino = initialize_serial(args.port, args.baud, args.demo)
+
+    logger.info("Hand Gesture Control Started! Press 'q' to quit")
+
+    # FPS calculation
+    fps_start_time = time.time()
+    fps_frame_count = 0
+    fps = 0
+
+    try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Can't receive frame")
-                break
-            
-            # Process frame
-            processed_frame = self.process_frame(frame)
-            
-            # Display
-            cv2.imshow('Hand Controller', processed_frame)
-            
-            # Exit on 'q'
+            success, img = cap.read()
+            if not success:
+                logger.warning("Failed to read frame from camera")
+                continue
+
+            fps_frame_count += 1
+            if time.time() - fps_start_time >= 1.0:
+                fps = fps_frame_count
+                fps_frame_count = 0
+                fps_start_time = time.time()
+
+            # Convert to RGB for MediaPipe
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = hands.process(img_rgb)
+
+            # Display FPS on image
+            cv2.putText(img, f"FPS: {fps}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    # Draw hand landmarks
+                    mp_drawing.draw_landmarks(
+                        img,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                        mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2)
+                    )
+
+                    # Get finger states
+                    fingers = fingers_up(hand_landmarks.landmark)
+                    logger.debug(f"Fingers detected: {fingers}")
+
+                    # Only send data if FPS is reasonable to avoid overload
+                    if fps >= 15:
+                        send_serial_data(arduino, fingers, args.demo)
+                    else:
+                        logger.warning(f"Low FPS ({fps}), skipping serial send")
+
+                    # Display finger states on image
+                    cv2.putText(img, f"Fingers: {fingers}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            cv2.imshow("Hand Gesture Control", img)
             if cv2.waitKey(1) & 0xFF == ord('q'):
+                logger.info("Quit signal received")
                 break
-        
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+    finally:
         # Cleanup
         cap.release()
         cv2.destroyAllWindows()
-        if self.arduino:
-            self.arduino.close()
+        if arduino and arduino.is_open:
+            arduino.close()
+            logger.info("Serial connection closed")
+        logger.info("Hand Gesture Control stopped")
 
-# Installation requirements (run these in terminal):
-# pip install opencv-python mediapipe pyserial
 
 if __name__ == "__main__":
-    # Change 'COM3' to your Arduino port
-    # Windows: COM3, COM4, etc.
-    # Linux: /dev/ttyUSB0, /dev/ttyACM0
-    # Mac: /dev/cu.usbmodemXXXX
-    
-    controller = HandController(port='COM3')  # CHANGE THIS TO YOUR PORT
-    controller.run()
+    main()
